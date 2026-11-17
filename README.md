@@ -9,14 +9,14 @@ wraps the generated management client with a one-shot 401 retry.
 
 This repository root is the crate root: `Cargo.toml`, `src/` and `tests/` live
 at the top level, with no nested workspace or crate directory. Current version:
-`0.2.0`.
+`0.2.1`.
 
 ## Dependencies
 
-`localgateway-sdk` depends on `localgateway-api` v0.2.0 through GitHub git + tag:
+`localgateway-sdk` depends on `localgateway-api` v0.2.1 through GitHub git + tag:
 
 ```toml
-localgateway-api = { git = "https://github.com/HuanyuMark/localgateway-api", tag = "v0.2.0", default-features = false }
+localgateway-api = { git = "https://github.com/HuanyuMark/localgateway-api", tag = "v0.2.1", default-features = false }
 ```
 
 `localgateway-provider` builds on this crate.
@@ -25,7 +25,7 @@ localgateway-api = { git = "https://github.com/HuanyuMark/localgateway-api", tag
 
 ```toml
 [dependencies]
-localgateway-sdk = { git = "https://github.com/HuanyuMark/localgateway-sdk", tag = "v0.2.0" }
+localgateway-sdk = { git = "https://github.com/HuanyuMark/localgateway-sdk", tag = "v0.2.1" }
 ```
 
 `localgateway-sdk` brings `localgateway-api` with it; do not declare both.
