@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use localgateway_sdk::{GatewayClient, PatchOptions, PortError, PortSource, RegisterOptions};
+use localgateway_sdk::{Cors, GatewayClient, PatchOptions, PortError, PortSource, RegisterOptions};
 
 #[derive(Default)]
 struct MockState {
@@ -28,6 +28,9 @@ struct MockState {
     valid_token: Mutex<String>,
     put_bodies: Mutex<Vec<Value>>,
     patch_bodies: Mutex<Vec<Value>>,
+    cors_puts: AtomicUsize,
+    cors_deletes: AtomicUsize,
+    cors_bodies: Mutex<Vec<Value>>,
     seen_tokens: Mutex<Vec<String>>,
 }
 
@@ -159,6 +162,44 @@ async fn unregister_service(State(state): State<Arc<MockState>>, headers: Header
     StatusCode::NO_CONTENT.into_response()
 }
 
+async fn put_cors(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state.cors_puts.fetch_add(1, Ordering::SeqCst);
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    state
+        .cors_bodies
+        .lock()
+        .expect("cors body log")
+        .push(parsed.clone());
+    let token = bearer_token(&headers);
+    let valid = state.valid_token.lock().expect("token lock").clone();
+    if token.as_deref() != Some(valid.as_str()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(error_json("unauthorized", "missing or expired token")),
+        )
+            .into_response();
+    }
+    axum::Json(json!({"name": "sdk-test", "revision": 42, "cors": parsed})).into_response()
+}
+
+async fn delete_cors(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Response {
+    state.cors_deletes.fetch_add(1, Ordering::SeqCst);
+    let token = bearer_token(&headers);
+    let valid = state.valid_token.lock().expect("token lock").clone();
+    if token.as_deref() != Some(valid.as_str()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(error_json("unauthorized", "missing or expired token")),
+        )
+            .into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn health(State(state): State<Arc<MockState>>) -> impl IntoResponse {
     state.health_hits.fetch_add(1, Ordering::SeqCst);
     axum::Json(json!({"pid": 10, "status": "ok", "version": "0.1.0"}))
@@ -174,6 +215,10 @@ fn mock_app(state: Arc<MockState>) -> Router {
                 .delete(unregister_service),
         )
         .route("/gw/health", get(health))
+        .route(
+            "/gw/services/{name}/cors",
+            put(put_cors).delete(delete_cors),
+        )
         .with_state(state)
 }
 
@@ -343,6 +388,84 @@ async fn patch_sends_only_the_requested_fields() {
     assert_eq!(body["probe"]["timeoutMs"], 500);
     assert_eq!(body["projectRoot"], "D:\\work\\provider");
     assert!(body.get("apiInfo").is_none());
+}
+
+#[tokio::test]
+async fn cors_is_sent_on_register_and_managed_with_dedicated_endpoints() {
+    let state = MockState::new();
+    let base_url = spawn_mock(Arc::clone(&state)).await;
+    let client = client_for(&base_url);
+
+    client
+        .register(
+            "sdk-test",
+            RegisterOptions::new(47821, "1.2.3", "/health").cors(Cors::allow_all()),
+        )
+        .await
+        .expect("register succeeds");
+    let body = state.put_bodies.lock().expect("body log")[0].clone();
+    assert_eq!(body["cors"]["allowAll"], true);
+
+    let response = client
+        .set_cors(
+            "sdk-test",
+            Cors {
+                allow_origins: vec!["http://localhost:5173".to_owned()],
+                allow_methods: vec!["GET".to_owned(), "POST".to_owned()],
+                allow_credentials: true,
+                max_age_seconds: Some(600),
+                ..Cors::default()
+            },
+        )
+        .await
+        .expect("set_cors succeeds");
+    assert_eq!(response.revision, 42);
+    let cors = response.cors.flatten().expect("cors in response");
+    assert_eq!(
+        cors.allow_origins.as_deref(),
+        Some(&["http://localhost:5173".to_owned()][..])
+    );
+    assert_eq!(cors.allow_credentials, Some(true));
+    assert_eq!(cors.max_age_seconds, Some(Some(600)));
+
+    client
+        .clear_cors("sdk-test")
+        .await
+        .expect("clear_cors succeeds");
+    assert_eq!(state.cors_puts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.cors_deletes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn invalid_cors_is_rejected_before_any_http_call() {
+    let state = MockState::new();
+    let base_url = spawn_mock(Arc::clone(&state)).await;
+    let client = client_for(&base_url);
+
+    let error = client
+        .set_cors("sdk-test", Cors::default())
+        .await
+        .expect_err("empty cors must fail");
+    assert!(matches!(error, localgateway_sdk::SdkError::InvalidCors(_)));
+
+    let error = client
+        .register(
+            "sdk-test",
+            RegisterOptions::new(47821, "1.2.3", "/health").cors(Cors {
+                max_age_seconds: Some(localgateway_sdk::client::MAX_CORS_MAX_AGE_SECONDS + 1),
+                ..Cors::allow_all()
+            }),
+        )
+        .await
+        .expect_err("out-of-range maxAgeSeconds must fail");
+    assert!(matches!(
+        error,
+        localgateway_sdk::SdkError::InvalidRegistration(_)
+    ));
+
+    assert_eq!(state.handshakes.load(Ordering::SeqCst), 0);
+    assert_eq!(state.puts.load(Ordering::SeqCst), 0);
+    assert_eq!(state.cors_puts.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -16,6 +16,6 @@ pub mod port;
 /// Re-export of the generated management client.
 pub use localgateway_api as api;
 
-pub use client::{GatewayClient, GatewayClientBuilder, PatchOptions, RegisterOptions};
+pub use client::{Cors, GatewayClient, GatewayClientBuilder, PatchOptions, RegisterOptions};
 pub use error::SdkError;
 pub use port::{PortError, PortSource, RegistryPortSource};

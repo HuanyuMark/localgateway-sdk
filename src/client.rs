@@ -24,6 +24,71 @@ use crate::port::{PortSource, RegistryPortSource};
 const MIN_PROBE_TIMEOUT_MS: u32 = 100;
 const MAX_PROBE_TIMEOUT_MS: u32 = 60_000;
 
+/// Upper bound for `cors.maxAgeSeconds` (7 days, matching the gateway).
+pub const MAX_CORS_MAX_AGE_SECONDS: u64 = 604_800;
+
+/// Service-level CORS configuration.
+///
+/// `allow_all = true` allows every origin, method and header in one flag.
+/// Otherwise at least one entry in [`Self::allow_origins`] is required.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cors {
+    /// Allow every origin, method and request header.
+    pub allow_all: bool,
+    /// Allowed origins, for example `http://localhost:5173`; supports `*` and `null`.
+    pub allow_origins: Vec<String>,
+    /// Allowed methods; empty echoes the preflight request.
+    pub allow_methods: Vec<String>,
+    /// Allowed request headers; empty echoes the preflight request.
+    pub allow_headers: Vec<String>,
+    /// Response headers exposed to the browser.
+    pub expose_headers: Vec<String>,
+    /// Allow cookies / `Authorization`.
+    pub allow_credentials: bool,
+    /// Preflight cache lifetime in seconds; `None` omits `Access-Control-Max-Age`.
+    pub max_age_seconds: Option<u64>,
+}
+
+impl Cors {
+    /// Allow every origin, method and request header.
+    #[must_use]
+    pub fn allow_all() -> Self {
+        Self {
+            allow_all: true,
+            ..Self::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !self.allow_all && self.allow_origins.is_empty() {
+            return Err("cors.allowOrigins is required unless allowAll is true".to_owned());
+        }
+        if let Some(seconds) = self.max_age_seconds
+            && seconds > MAX_CORS_MAX_AGE_SECONDS
+        {
+            return Err(format!(
+                "cors.maxAgeSeconds must be at most {MAX_CORS_MAX_AGE_SECONDS}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_model(&self) -> models::CorsConfig {
+        models::CorsConfig {
+            allow_all: Some(self.allow_all),
+            allow_credentials: Some(self.allow_credentials),
+            allow_headers: (!self.allow_headers.is_empty()).then(|| self.allow_headers.clone()),
+            allow_methods: (!self.allow_methods.is_empty()).then(|| self.allow_methods.clone()),
+            allow_origins: (!self.allow_origins.is_empty()).then(|| self.allow_origins.clone()),
+            expose_headers: (!self.expose_headers.is_empty()).then(|| self.expose_headers.clone()),
+            max_age_seconds: self
+                .max_age_seconds
+                .and_then(|seconds| i64::try_from(seconds).ok())
+                .map(Some),
+        }
+    }
+}
+
 /// Options for `PUT /gw/services/{name}`.
 #[derive(Debug, Clone)]
 pub struct RegisterOptions {
@@ -41,6 +106,8 @@ pub struct RegisterOptions {
     pub project_root: Option<String>,
     /// Optional port change notification URL.
     pub notify_url: Option<String>,
+    /// Optional CORS configuration; the gateway serves preflight requests.
+    pub cors: Option<Cors>,
 }
 
 impl RegisterOptions {
@@ -55,6 +122,7 @@ impl RegisterOptions {
             api_info: None,
             project_root: None,
             notify_url: None,
+            cors: None,
         }
     }
 
@@ -86,6 +154,13 @@ impl RegisterOptions {
         self
     }
 
+    /// Attach a CORS configuration; the gateway answers preflight requests.
+    #[must_use]
+    pub fn cors(mut self, cors: Cors) -> Self {
+        self.cors = Some(cors);
+        self
+    }
+
     /// Validate the locally checkable parts of the request.
     pub fn validate(&self) -> Result<(), SdkError> {
         self.to_request().map(|_| ())
@@ -104,6 +179,9 @@ impl RegisterOptions {
         }
         validate_probe(&self.probe_path, self.probe_timeout_ms)
             .map_err(SdkError::InvalidRegistration)?;
+        if let Some(cors) = &self.cors {
+            cors.validate().map_err(SdkError::InvalidRegistration)?;
+        }
 
         Ok(models::RegisterRequest {
             port: i32::from(self.port),
@@ -116,6 +194,10 @@ impl RegisterOptions {
                 timeout_ms: self.probe_timeout_ms.map(|timeout| timeout as i32),
             }))),
             notify_url: self.notify_url.clone().map(Some),
+            cors: self
+                .cors
+                .as_ref()
+                .map(|cors| Some(Box::new(cors.to_model()))),
         })
     }
 }
@@ -137,6 +219,7 @@ pub struct PatchOptions {
     api_info: Option<Value>,
     project_root: Option<String>,
     probe: Option<ProbeUpdate>,
+    cors: Option<Cors>,
 }
 
 impl PatchOptions {
@@ -170,20 +253,33 @@ impl PatchOptions {
         self
     }
 
+    /// Replace the CORS configuration.
+    #[must_use]
+    pub fn cors(mut self, cors: Cors) -> Self {
+        self.cors = Some(cors);
+        self
+    }
+
     /// Whether no field would be changed.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.api_info.is_none() && self.project_root.is_none() && self.probe.is_none()
+        self.api_info.is_none()
+            && self.project_root.is_none()
+            && self.probe.is_none()
+            && self.cors.is_none()
     }
 
     fn to_request(&self) -> Result<models::PatchRequest, SdkError> {
         if self.is_empty() {
             return Err(SdkError::InvalidPatch(
-                "patch must change at least one of apiInfo, projectRoot, probe".to_owned(),
+                "patch must change at least one of apiInfo, projectRoot, probe, cors".to_owned(),
             ));
         }
         if let Some(probe) = &self.probe {
             validate_probe(&probe.path, probe.timeout_ms).map_err(SdkError::InvalidPatch)?;
+        }
+        if let Some(cors) = &self.cors {
+            cors.validate().map_err(SdkError::InvalidPatch)?;
         }
 
         Ok(models::PatchRequest {
@@ -195,6 +291,10 @@ impl PatchOptions {
                     timeout_ms: probe.timeout_ms.map(|timeout| timeout as i32),
                 }))
             }),
+            cors: self
+                .cors
+                .as_ref()
+                .map(|cors| Some(Box::new(cors.to_model()))),
         })
     }
 }
@@ -411,6 +511,50 @@ impl GatewayClient {
             async move {
                 let configuration = client.configuration(Some(&token))?;
                 services_api::patch_service(&configuration, &service_name, request)
+                    .await
+                    .map_err(map_api_error)
+            }
+        })
+        .await
+    }
+
+    /// Replace the CORS configuration of a registered provider.
+    ///
+    /// Use [`Cors::allow_all`] to allow every origin in one call. The gateway
+    /// answers preflight requests and rewrites `Access-Control-*` headers.
+    pub async fn set_cors(
+        &self,
+        service_name: &str,
+        cors: Cors,
+    ) -> Result<models::CorsResponse, SdkError> {
+        cors.validate().map_err(SdkError::InvalidCors)?;
+        let cors = cors.to_model();
+        let service_name = service_name.to_owned();
+
+        self.with_retry(|token| {
+            let cors = cors.clone();
+            let service_name = service_name.clone();
+            let client = self;
+            async move {
+                let configuration = client.configuration(Some(&token))?;
+                services_api::put_service_cors(&configuration, &service_name, cors)
+                    .await
+                    .map_err(map_api_error)
+            }
+        })
+        .await
+    }
+
+    /// Clear the CORS configuration, restoring passthrough of provider headers.
+    pub async fn clear_cors(&self, service_name: &str) -> Result<(), SdkError> {
+        let service_name = service_name.to_owned();
+
+        self.with_retry(|token| {
+            let service_name = service_name.clone();
+            let client = self;
+            async move {
+                let configuration = client.configuration(Some(&token))?;
+                services_api::delete_service_cors(&configuration, &service_name)
                     .await
                     .map_err(map_api_error)
             }

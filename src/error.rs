@@ -14,6 +14,9 @@ pub enum SdkError {
     /// A `PATCH /gw/services/{name}` request failed local validation.
     #[error("invalid patch: {0}")]
     InvalidPatch(String),
+    /// A CORS configuration failed local validation.
+    #[error("invalid cors: {0}")]
+    InvalidCors(String),
     /// The HTTP request did not produce a usable response.
     #[error("gateway transport error: {0}")]
     Transport(String),
